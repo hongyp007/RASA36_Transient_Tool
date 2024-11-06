@@ -108,6 +108,7 @@ class Config:
     # Optional parameters (with defaults)
     view_mode: bool = False
     specific_view_mode: Optional[str] = None
+    quick_start: bool = False
 
     @staticmethod
     def load_config(config_path: str = 'config.ini') -> 'Config':
@@ -192,7 +193,21 @@ class Config:
             classification_labels = [label.strip() for label in 
                                   config.get('Settings', 'classification_labels', fallback='').split(',')]
 
-            # Create config instance with all required parameters
+            # Set up logging configuration
+            log_file = get_config_option('Logging', 'log_file', str, 'transient_tool.log')
+            log_level = get_config_option('Logging', 'log_level', str, 'INFO').upper()
+            
+            # Configure logging
+            logging.basicConfig(
+                filename=log_file,
+                level=getattr(logging, log_level),
+                format='%(asctime)s - %(levelname)s - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            
+            logging.info("Configuration loaded successfully")
+            
+            # Create config instance with all parameters
             config_obj = Config(
                 data_directory=get_config_option('Paths', 'data_directory', str, ''),
                 file_pattern=get_config_option('Paths', 'file_pattern', str, ''),
@@ -209,8 +224,8 @@ class Config:
                 vmax_science=get_config_option('Settings', 'vmax_science', str, 'max').lower(),
                 vmin_reference=get_config_option('Settings', 'vmin_reference', str, 'median').lower(),
                 vmax_reference=get_config_option('Settings', 'vmax_reference', str, 'max').lower(),
-                log_file=get_config_option('Logging', 'log_file', str, 'transient_tool.log'),
-                log_level=get_config_option('Logging', 'log_level', str, 'INFO').upper(),
+                log_file=log_file,
+                log_level=log_level,
                 shortcuts=shortcuts,
                 file_type=get_config_option('Settings', 'file_type', str, 'fits').lower(),
                 tile_ids=tile_ids,  # 빈 리스트여도 괜찮음
@@ -219,7 +234,8 @@ class Config:
                 cache_window=get_config_option('TileSettings', 'cache_window', int, 10),
                 preload_batch_size=get_config_option('TileSettings', 'preload_batch_size', int, 5),
                 view_mode=view_mode,
-                specific_view_mode=specific_view_mode
+                specific_view_mode=specific_view_mode,
+                quick_start=get_config_option('Mode', 'quick_start', bool, False)
             )
 
             # Validation of required fields
@@ -240,8 +256,7 @@ class Config:
             return config_obj
 
         except Exception as e:
-            logging.exception(f"Error loading configuration: {e}")
-            raise
+            raise ValueError(f"Failed to load configuration: {e}")
 
 class DataManager:
     """
@@ -264,77 +279,71 @@ class DataManager:
     """
 
     def __init__(self, config: Config):
-        """
-        Initialize DataManager with configuration settings.
-        
-        Args:
-            config: Configuration object containing all settings
-            
-        Raises:
-            FileNotFoundError: If no valid files found for specified tile IDs
-            ValueError: If required configuration options are missing
-        """
+        """Initialize DataManager with configuration."""
+        # Configuration and basic attributes
         self.config = config
-        self.file_lock = threading.Lock()
-        self.region_df = pd.DataFrame()
-        self.image_processor = ImageProcessor(config)
-        self.data_validator = DataValidator(config)
-        self.index = 0  # Initialize index to 0
+        self.region_df = None
+        self.index = 0
+        self.total_images = 0
         
-        # Load files and initialize DataFrame
-        self.load_files()
-        self.init_dataframe()
-        
-        # Update index with starting index
-        self.index = self.get_starting_index()
-        logging.info("DataManager initialized.")
-
-        # Add image cache settings
+        # Cache related attributes
+        self.image_cache = {}
         self.cache_window = config.cache_window
         self.preload_batch_size = config.preload_batch_size
-        self.preload_thread = None
+        
+        # Thread locks
+        self.cache_lock = threading.Lock()
         self.preload_lock = threading.Lock()
+        self.preload_thread = threading.Thread()
+        self.file_lock = threading.Lock()
+        
+        # Helper components
+        self.image_processor = ImageProcessor(config)
+        self.data_validator = DataValidator(config)
+
+        # Load data based on quick_start mode
+        if hasattr(self.config, 'quick_start') and self.config.quick_start:
+            self._quick_start_load()
+        else:
+            self._full_load()
+            
+        logging.info("DataManager initialized.")
+
+    def _quick_start_load(self):
+        """Load data directly from CSV without scanning directories."""
+        try:
+            if os.path.exists(self.config.output_csv_file):
+                self.region_df = pd.read_csv(self.config.output_csv_file)
+                logging.info(f"Found existing CSV with {len(self.region_df)} entries")
+                # Initialize DataFrame structure
+                self.init_dataframe()
+            else:
+                raise FileNotFoundError("Required CSV file not found for quick start mode")
+        except Exception as e:
+            logging.error(f"Error in quick start load: {e}")
+            raise
+
+    def _full_load(self):
+        """Perform full load with directory scanning."""
+        try:
+            self.load_files()  # This includes directory scanning
+        except Exception as e:
+            logging.error(f"Error in full load: {e}")
+            raise
 
     def load_files(self):
-        """Load files either from existing CSV or by scanning directory."""
+        """Load files and initialize DataFrame."""
         try:
+            # Load existing data if available
             existing_data = None
-            
-            # Load existing CSV if available
             if os.path.exists(self.config.output_csv_file):
-                # Include both required columns and classification labels
-                required_columns = self.config.columns_order + self.config.classification_labels
-                df = pd.read_csv(self.config.output_csv_file, usecols=required_columns)
-                
-                if not df.empty and all(col in df.columns for col in required_columns):
-                    # Remove total row and create explicit copy
-                    existing_data = df[df['file_index'] != -1].copy()
-                    # Ensure data types using .loc
-                    existing_data.loc[:, 'tile_id'] = existing_data['tile_id'].astype(str)
-                    existing_data.loc[:, 'unique_number'] = existing_data['unique_number'].astype(int)
-                    
-                    # Ensure all classification columns exist and are integers
-                    for col in self.config.classification_labels:
-                        if col not in existing_data.columns:
-                            existing_data.loc[:, col] = 0
-                        existing_data.loc[:, col] = existing_data[col].fillna(0).astype(int)
-                    
-                    logging.info(f"Found existing CSV with {len(existing_data)} entries")
+                existing_data = pd.read_csv(self.config.output_csv_file)
+                logging.info(f"Found existing CSV with {len(existing_data)} entries")
 
             # Get current files, using existing data to avoid reprocessing
             if existing_data is not None:
-                # Get list of existing tile_id and unique_number combinations
-                existing_keys = set(zip(existing_data['tile_id'], existing_data['unique_number']))
-                # Scan only for new files
-                current_files = self.scan_directory_for_files(existing_keys)
-                
-                if not current_files.empty:
-                    # Combine existing data with new files
-                    self.region_df = pd.concat([existing_data, current_files], ignore_index=True).copy()
-                    logging.info(f"Added {len(current_files)} new files to existing {len(existing_data)} entries")
-                else:
-                    self.region_df = existing_data.copy()
-                    logging.info("No new files found")
+                self.region_df = existing_data.copy()
+                logging.info("Using existing data without rescanning")
             else:
                 # No existing data, scan all files
                 self.region_df = self.scan_directory_for_files().copy()
@@ -439,9 +448,15 @@ class DataManager:
             # Create a copy to avoid chained assignment
             df = self.region_df.copy()
             
+            # Remove total row (file_index == -1) if exists
+            df = df[df['file_index'] != -1]
+            
+
             # Validate DataFrame structure
             is_valid, errors = self.data_validator.validate_dataframe(df)
             if not is_valid:
+                logging.warning(f"DataFrame validation failed: {errors}")
+                
                 # Add missing columns if needed
                 for col in self.config.classification_labels:
                     if col not in df.columns:
@@ -450,23 +465,37 @@ class DataManager:
 
                 if 'Memo' not in df.columns:
                     df.loc[:, 'Memo'] = ''
+                df['Memo'] = df['Memo'].fillna('').astype(str)
 
                 if 'Scale' not in df.columns:
                     df.loc[:, 'Scale'] = self.config.scale
+                df['Scale'] = df['Scale'].fillna(self.config.scale).astype(str)
 
             # Ensure proper column order including classification labels
             all_columns = [*self.config.columns_order, *self.config.classification_labels]
             existing_columns = [col for col in all_columns if col in df.columns]
+            
+            # Verify all required columns exist
+            missing_columns = set(self.config.columns_order) - set(df.columns)
+            if missing_columns:
+                raise ValueError(f"Missing required columns: {missing_columns}")
+                
             df = df[existing_columns]
 
-            # Sort by file_index and reset index
+            # Sort by file_index and reset index to ensure alignment
             df = df.sort_values('file_index').reset_index(drop=True)
+
+            # Fix file_index alignment
+            if not df['file_index'].equals(pd.Series(range(len(df)))):
+                logging.warning("Fixing non-sequential file_index values")
+                df['file_index'] = range(len(df))
             
             # Assign back to self.region_df
             self.region_df = df
             
-            # Save the initialized DataFrame
-            self.save_dataframe()
+            # Only save if not in quick_start mode
+            if not self.config.quick_start:
+                self.save_dataframe()
             
             logging.info(f"DataFrame initialized with {len(self.region_df)} rows")
 
@@ -503,8 +532,8 @@ class DataManager:
             logging.error(f"Critical error in get_starting_index: {e}")
             raise
 
-    def save_dataframe(self, callback=None):
-        """Save the DataFrame to CSV with totals."""
+    def save_dataframe(self, mode='w', callback=None):
+        """Save the DataFrame to CSV file."""
         try:
             # Validate DataFrame before saving
             is_valid, errors = self.data_validator.validate_dataframe(self.region_df)
@@ -516,6 +545,9 @@ class DataManager:
             # Create a copy to avoid modifying the original
             df_to_save = self.region_df.copy()
             
+            # Ensure Memo column is preserved as string
+            df_to_save['Memo'] = df_to_save['Memo'].astype(str)
+            
             # Calculate totals for classifications
             totals = {}
             for col in self.config.classification_labels:
@@ -526,22 +558,25 @@ class DataManager:
             total_processed = len(df_to_save[df_to_save[self.config.classification_labels].any(axis=1)])
             percent_processed = (total_processed/total_images*100) if total_images > 0 else 0
             
-            # Create total row with proper sequence
+            # Create total row
             total_dict = {
-                'file_index': -1,  # -1 means no need indexing
+                'file_index': -1,
                 'tile_id': 'Total',
-                'unique_number': len(self.config.tile_ids),  # Number of tile IDs
-                'Memo': f"{total_processed}/{total_images}",  # Processed/Total images
-                'Scale': f"{percent_processed:.1f}%"  # Percentage processed
+                'unique_number': len(self.config.tile_ids),
+                'Memo': f"{total_processed}/{total_images}",
+                'Scale': f"{percent_processed:.1f}%"
             }
-            total_dict.update(totals)  # Add classification totals
+            total_dict.update(totals)
 
-            # Add total row to the DataFrame
-            df_with_total = pd.concat([df_to_save, pd.DataFrame([total_dict])], ignore_index=True)
+            # Remove any existing total rows and duplicates
+            df_to_save = df_to_save[df_to_save['file_index'] != -1].drop_duplicates(subset=['tile_id', 'unique_number'])
+            
+            # Append total row
+            df_to_save = pd.concat([df_to_save, pd.DataFrame([total_dict])], ignore_index=True)
 
-            # Save to CSV with proper locking
+            # Save with file lock
             with self.file_lock:
-                df_with_total.to_csv(self.config.output_csv_file, index=False, na_rep='')
+                df_to_save.to_csv(self.config.output_csv_file, index=False, mode='w', na_rep='')
                 logging.info(f"DataFrame saved successfully to {self.config.output_csv_file}")
 
             if callback:
@@ -554,6 +589,12 @@ class DataManager:
     def load_image_data(self, index: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Load all image data for the current index using ImageProcessor.
+        
+        Args:
+            index: DataFrame index (not file_index)
+            
+        Returns:
+            Tuple of (subtracted, science, reference) image data
         """
         try:
             index = int(index)
@@ -561,10 +602,12 @@ class DataManager:
             if index < 0 or index >= len(self.region_df):
                 raise ValueError(f"Index {index} out of bounds for DataFrame with {len(self.region_df)} rows")
                 
-            # Use file_index for lookup instead of DataFrame index
-            current_row = self.region_df[self.region_df['file_index'] == index].iloc[0]
+            # Get row directly using DataFrame index
+            current_row = self.region_df.iloc[index]
             tile_id = current_row['tile_id']
             unique_number = current_row['unique_number']
+            
+            logging.debug(f"Loading images for index {index}: tile_id={tile_id}, unique_number={unique_number}")
             
             # Use ImageProcessor to load and process images
             return self.image_processor.load_and_process_images(tile_id, unique_number)
@@ -582,12 +625,22 @@ class DataManager:
         """
         try:
             with self.preload_lock:
+                # Calculate preload range based on config
                 end_index = min(start_index + self.preload_batch_size, len(self.region_df))
+                
+                # Only preload images within cache window
+                window_end = min(len(self.region_df), start_index + self.cache_window)
+                end_index = min(end_index, window_end)
+                
                 for idx in range(start_index, end_index):
-                    if idx not in self.image_processor.image_cache:
-                        tile_id = self.region_df.iloc[idx]['tile_id']
-                        unique_number = self.region_df.iloc[idx]['unique_number']
-                        self.image_processor.load_and_process_images(tile_id, unique_number)
+                    current_row = self.region_df.iloc[idx]
+                    cache_key = f"{current_row['tile_id']}_{current_row['unique_number']}"
+                    
+                    if cache_key not in self.image_processor.image_cache:
+                        self.image_processor.load_and_process_images(
+                            current_row['tile_id'], 
+                            current_row['unique_number']
+                        )
                         
         except Exception as e:
             logging.error(f"Error preloading images: {e}")
@@ -616,13 +669,18 @@ class DataManager:
                 window_start = max(0, current_index - self.cache_window)
                 window_end = min(len(self.region_df), current_index + self.cache_window)
                 
-                # Get keys to remove (outside window)
+                # Get indices within window
+                valid_indices = set(range(window_start, window_end + 1))
+                
+                # Get all cached keys
                 cache_keys = list(self.image_processor.image_cache.keys())
+                
+                # Remove items outside window
                 for key in cache_keys:
                     tile_id, unique_number = key.split('_')
                     unique_number = int(unique_number)
                     
-                    # Find index for this key
+                    # Find index for this key using file_index
                     matching_rows = self.region_df[
                         (self.region_df['tile_id'] == tile_id) & 
                         (self.region_df['unique_number'] == unique_number)
@@ -630,9 +688,12 @@ class DataManager:
                     
                     if not matching_rows.empty:
                         idx = matching_rows.index[0]
-                        if idx < window_start or idx > window_end:
+                        if idx not in valid_indices:
                             del self.image_processor.image_cache[key]
                             
+                # Log cache status
+                logging.debug(f"Cache size after cleanup: {len(self.image_processor.image_cache)}")
+                
         except Exception as e:
             logging.error(f"Error cleaning cache: {e}")
 
@@ -926,24 +987,23 @@ class TransientTool:
         self.view_size = [1/self.zoom_level, 1/self.zoom_level]
         
         # Initialize data attributes
-        self.index = 0
+        # Initialize data manager first before accessing its index
+        self.data_manager = DataManager(config)
+        self.index = self.data_manager.index
+        self.num_images = len(self.data_manager.region_df)
         self.science_data = None
         self.reference_data = None
         self.sci_ref_visible = self.config.default_sci_ref_visible
         
-        # Initialize DataManager
-        self.data_manager = DataManager(config)
-        self.num_images = len(self.data_manager.region_df)
-        
         # Set up the main window
         self.master.title("Transient Detection Tool")
         self.setup_ui()
+
+        # Bind keyboard shortcuts after UI setup
+        self.bind_shortcuts()
         
-        # Start from first unclassified image if not in view mode
-        if not self.config.view_mode:
-            self.goto_unclassified()
-        else:
-            self.display_images()
+        # Start from first unclassified image 
+        self.goto_unclassified()
             
         logging.info(f"Initializing in {'view' if self.config.view_mode else 'normal'} mode")
 
@@ -1023,7 +1083,7 @@ class TransientTool:
 
     def create_memo_section(self, parent_frame: Frame):
         """
-        Create the memo text box with auto-enable/disable functionality.
+        Create the memo text box that activates on click and saves on any outside click.
         """
         memo_frame = Frame(parent_frame)
         memo_frame.grid(row=2, column=0, sticky='ew', padx=5, pady=5)
@@ -1034,81 +1094,44 @@ class TransientTool:
             memo_frame,
             height=4,
             wrap='word',
-            state='disabled',
-            highlightthickness=0,             # No border initially
-            bd=0,                             # No border width
-            bg='#f0f0f0',                     # Light gray background to match disabled look
-            fg='black'                        # Text color
+            state='disabled',  # Start disabled
+            bd=1,             # Add a border
+            bg='#F0F0F0',     # Light gray background when disabled
+            fg='black'        # Text color
         )
         self.memo_text.pack(fill='x', expand=True)
 
-        # Bind focus events
-        self.memo_text.bind('<Button-1>', self.on_memo_click)
+        # Bind click events
+        self.memo_text.bind('<Button-1>', self.activate_memo)
         
-        # Bind click events to the main window and all frames to handle focus loss
-        self.master.bind('<Button-1>', self.check_memo_focus)
-        parent_frame.bind('<Button-1>', self.check_memo_focus)
-        memo_frame.bind('<Button-1>', self.check_memo_focus)
+        # Bind click event to the main window for saving memo
+        self.master.bind('<Button-1>', self.check_memo_click, add='+')
 
-    def check_memo_focus(self, event):
-        """
-        Check if click was outside memo box and save/disable if necessary.
-        """
-        if event.widget != self.memo_text:
-            self.save_and_disable_memo()
+    def activate_memo(self, event=None):
+        """Activate memo text box for editing."""
+        if self.memo_text['state'] == 'disabled':
+            self.memo_text.config(state='normal', bg='white')  # Enable and change background to white
+            self.memo_text.focus_set()  # Set focus to the text box
+            return 'break'  # Prevent event propagation
 
-    def on_memo_click(self, event):
+    def check_memo_click(self, event):
         """
-        Enable memo editing when clicked.
+        Check if click was outside memo box and save if necessary.
         """
-        if self.memo_text.cget('state') == 'disabled':
-            self.memo_editing = True  # Set flag when enabling memo editing
-            self.memo_text.config(
-                state='normal',
-                highlightthickness=2,            
-                highlightbackground='blue',      
-                highlightcolor='blue',           
-                bg='white',                      
-                fg='black'                       
-            )
-            logging.debug("Memo text box enabled for editing. Shortcuts disabled.")
-            return "break"  
-
-    def save_and_disable_memo(self):
-        """Save memo content and disable editing."""
-        if self.memo_text.cget('state') == 'normal':
-            try:
-                current_row = self.data_manager.region_df.iloc[self.index]
-                
-                # Get memo text and ensure empty string is preserved
-                memo_text = self.memo_text.get('1.0', 'end').strip()
-                self.current_memo = memo_text
-                
-                # Always store as empty string instead of NaN
-                self.data_manager.region_df.at[self.index, 'Memo'] = memo_text
-                
-                # Save changes
-                self.data_manager.save_dataframe()
-                
-                # Disable memo text box
-                self.memo_text.config(
-                    state='disabled',
-                    highlightthickness=0,
-                    bg='#f0f0f0',
-                    fg='black'
-                )
-                self.memo_editing = False
-                
-                # Log success
-                logging.info(f"Memo saved for Tile: {current_row['tile_id']}, "
-                           f"Number: {current_row['unique_number']}")
-                
-                # Reset focus
-                self.canvas.get_tk_widget().focus_set()
-                
-            except Exception as e:
-                logging.error(f"Error saving memo: {e}")
-                messagebox.showerror("Error", f"Failed to save memo: {e}")
+        if not hasattr(self, 'memo_text'):
+            return
+        
+        # Get memo widget coordinates
+        memo_x = self.memo_text.winfo_rootx()
+        memo_y = self.memo_text.winfo_rooty()
+        memo_width = self.memo_text.winfo_width()
+        memo_height = self.memo_text.winfo_height()
+        
+        # Check if click was outside memo box
+        if (event.x_root < memo_x or event.x_root > memo_x + memo_width or
+            event.y_root < memo_y or event.y_root > memo_y + memo_height):
+            if self.memo_text['state'] == 'normal':
+                self.save_and_disable_memo()
 
     # Get shortcuts from config
     def get_shortcut_key(self, shortcut_name: str) -> str:
@@ -1207,7 +1230,10 @@ class TransientTool:
         if available_tiles:  # Set default value if available
             self.tile_combobox.set(available_tiles[0])
         self.tile_combobox.pack(side='left', padx=2)
-        Button(tile_frame, text="Go", command=self.goto_tile_id).pack(side='left', padx=2)
+        
+        # Bind combobox selection to goto_tile_id
+        self.tile_combobox.bind('<<ComboboxSelected>>', 
+                              lambda e: self.goto_tile_id())
         
         # Jump to Unique Number controls
         unique_frame = Frame(goto_inner_frame)
@@ -1283,8 +1309,9 @@ class TransientTool:
     def goto_unclassified(self):
         """Find and navigate to the first unclassified image."""
         try:
-            # Find first unclassified image
+            # Filter out the total row (file_index == -1) and find first unclassified image
             unclassified = self.data_manager.region_df[
+                (self.data_manager.region_df['file_index'] != -1) &  # Exclude total row
                 ~self.data_manager.region_df[self.config.classification_labels].any(axis=1)
             ]
             
@@ -1299,6 +1326,13 @@ class TransientTool:
             else:
                 messagebox.showinfo("Info", "No unclassified images found!")
                 logging.info("No unclassified images found")
+                # If no unclassified images found, go to first valid image
+                valid_images = self.data_manager.region_df[
+                    self.data_manager.region_df['file_index'] != -1
+                ]
+                if not valid_images.empty:
+                    self.index = valid_images.index[0]
+                    self.display_images()
                 
         except Exception as e:
             logging.error(f"Error finding unclassified image: {e}")
@@ -1400,18 +1434,19 @@ class TransientTool:
         All shortcuts are loaded from config file.
         """
         def handle_shortcut(event):
-            if self.memo_editing:  # Skip if editing memo
+            if hasattr(self, 'memo_editing') and self.memo_editing:  # Skip if editing memo
                 return
                 
             key = event.keysym.lower()  # Convert to lowercase for consistent matching
             
-            # Handle classification shortcuts
-            for label in self.config.classification_labels:
-                shortcut = self.config.shortcuts.get(f'{label.lower()}_key', '').lower()
-                if key == shortcut:
-                    self.save_classification(label, 1)
-                    return
-            
+            # Handle classification shortcuts - disabled in view modes
+            if not self.config.view_mode and self.config.specific_view_mode is None:
+                for label in self.config.classification_labels:
+                    shortcut = self.config.shortcuts.get(f'{label.lower()}_key', '').lower()
+                    if key == shortcut:
+                        self.save_classification(label, 1)
+                        return
+                    
             # Handle navigation shortcuts
             if key == self.config.shortcuts.get('next_key', '').lower():
                 self.next_image()
@@ -1472,17 +1507,22 @@ class TransientTool:
             # Get statistics
             stats = self._update_progress_stats()
             
-            # Update progress bar
+            # Update progress bar with total progress
             self.progress_var.set(int(stats['overall_progress']))
             
-            # Update status text
+            # Update status text with total and per-tile progress
             status_text = (f"Total Progress: {stats['overall_progress']:.1f}% "
-                          f"({stats['total_classified']}/{stats['total_images']})\n")
-                          
-            for tile_id, tile_stat in stats['tile_stats'].items():
+                      f"({stats['total_classified']}/{stats['total_images']})\n\n"
+                      f"Progress by Tile:\n"
+                      f"{'=' * 30}\n")
+                      
+            # Sort tile_ids for consistent display
+            sorted_tiles = sorted(stats['tile_stats'].keys())
+            for tile_id in sorted_tiles:
+                tile_stat = stats['tile_stats'][tile_id]
                 if tile_stat['total'] > 0:  # Only show tiles that have images
-                    status_text += (f"{tile_id}: {tile_stat['classified']}/"
-                                  f"{tile_stat['total']} ({tile_stat['percent']:.1f}%)\n")
+                    status_text += (f"{tile_id}: {tile_stat['percent']:.1f}% "
+                              f"({tile_stat['classified']}/{tile_stat['total']})\n")
             
             # Update the status text widget
             if hasattr(self, 'status_text'):
@@ -1535,13 +1575,13 @@ class TransientTool:
             self.update_scale_labels(sub_data, new_data, ref_data)
 
             # Display science image
-            if new_data is not None:
+            if self.sci_ref_visible and new_data is not None:
                 # Prepare normalization once for FITS
                 if self.config.file_type == 'fits':
                     sci_norm = self.image_processor.prepare_normalization(new_data,
                                         self.config.vmin_science,
                                         self.config.vmax_science)
-                    img_args = {'norm': sci_norm, 'origin': 'lower'}
+                    img_args = {'cmap': 'gray', 'norm': sci_norm, 'origin': 'lower'}
                 else:  # PNG case
                     img_args = {'origin': 'lower'}
                     
@@ -1555,7 +1595,7 @@ class TransientTool:
                     norm = self.image_processor.prepare_normalization(sub_data,
                                         self.config.vmin_subtracted,
                                         self.config.vmax_subtracted)
-                    img_args = {'norm': norm, 'origin': 'lower'}
+                    img_args = {'cmap': 'gray', 'norm': norm, 'origin': 'lower'}
                 else:  # PNG case
                     img_args = {'origin': 'lower'}
                     
@@ -1569,7 +1609,7 @@ class TransientTool:
                     ref_norm = self.image_processor.prepare_normalization(ref_data,
                                         self.config.vmin_reference,
                                         self.config.vmax_reference)
-                    img_args = {'norm': ref_norm, 'origin': 'lower'}
+                    img_args = {'cmap': 'gray', 'norm': ref_norm, 'origin': 'lower'}
                 else:  # PNG case
                     img_args = {'origin': 'lower'}
 
@@ -1713,20 +1753,50 @@ class TransientTool:
                 
         except Exception as e:
             logging.error(f"Error updating scale labels: {e}")
+    
+    def save_and_disable_memo(self):
+        """Save memo content and disable editing."""
+        try:
+            if self.memo_text['state'] == 'normal':
+                # Get memo text (strip to remove extra whitespace)
+                memo_text = self.memo_text.get('1.0', 'end-1c').strip()
+                
+                # Update DataFrame with memo text
+                self.data_manager.region_df.at[self.index, 'Memo'] = memo_text
+                self.data_manager.save_dataframe()
+                
+                # Disable text box and change appearance
+                self.memo_text.config(state='disabled', bg='#F0F0F0')
+                
+                current_row = self.data_manager.region_df.iloc[self.index]
+                logging.info(f"Memo saved for Tile: {current_row['tile_id']}, "
+                            f"Number: {current_row['unique_number']}, "
+                            f"Memo: '{memo_text}'")
+                
+        except Exception as e:
+            logging.error(f"Error saving memo: {e}")
+            messagebox.showerror("Error", f"Failed to save memo: {e}")
 
-    @handle_exceptions
     def load_memo(self, unique_number: int):
         """Load and display memo for the current image."""
         try:
             current_row = self.data_manager.region_df.iloc[self.index]
+            
             # Convert memo to string and handle NaN/float cases
             memo = str(current_row.get('Memo', ''))
-            if memo == 'nan':
+            if memo.lower() == 'nan':
                 memo = ''
+                
+            # Enable temporarily to update text
             self.memo_text.config(state='normal')
             self.memo_text.delete('1.0', 'end')
-            self.memo_text.insert('end', memo)
-            self.memo_text.config(state='disabled')
+            self.memo_text.insert('1.0', memo)
+            self.memo_text.config(state='disabled', bg='#F0F0F0')
+            
+            logging.debug(f"Loaded memo for Tile: {current_row['tile_id']}, "
+                         f"Number: {current_row['unique_number']}, "
+                         f"Memo: '{memo}'")
+            
         except Exception as e:
             logging.error(f"Error loading memo: {e}")
 
@@ -1820,12 +1890,12 @@ class TransientTool:
             
             # Update metadata
             memo_text = self.memo_text.get('1.0', 'end').strip()
-            # Convert empty string to '' instead of NaN
-            memo_value = '' if not memo_text else memo_text
+            # Convert empty string to '' instead of NaN and ensure string type
+            memo_value = str('' if not memo_text else memo_text)
             self.data_manager.region_df.at[self.index, 'Memo'] = memo_value
-            self.data_manager.region_df.at[self.index, 'Scale'] = self.config.scale
+            self.data_manager.region_df.at[self.index, 'Scale'] = str(self.config.scale)
             
-            # Save DataFrame immediately
+            # Save DataFrame
             self.data_manager.save_dataframe(callback=self.after_classification_save)
             
             # Log the save
@@ -1955,35 +2025,44 @@ class TransientTool:
             messagebox.showerror("Error", f"Failed to jump to tile: {e}")
    
     def goto_unique_number(self):
-        """Jump to the image with the specified unique number."""
+        """Go to specific unique number within current tile."""
         try:
-            unique_num = int(self.unique_entry.get())
+            # Get current tile_id
+            current_tile = self.data_manager.region_df.iloc[self.index]['tile_id']
             
-            # Find the image with this unique number using file_index
-            matching_images = self.data_manager.region_df[
-                self.data_manager.region_df['unique_number'] == unique_num
-            ]
-            
-            if matching_images.empty:
-                messagebox.showwarning("Warning", f"No image found with unique number {unique_num}")
+            # Get unique number from entry box
+            unique_num_str = self.unique_entry.get().strip()
+            if not unique_num_str:
                 return
                 
-            # Get the file_index of the matching image
-            target_index = matching_images['file_index'].iloc[0]
+            try:
+                unique_num = int(unique_num_str)
+            except ValueError:
+                messagebox.showerror("Error", "Please enter a valid number")
+                return
+                
+            # Find the unique number within the current tile
+            matching_images = self.data_manager.region_df[
+                (self.data_manager.region_df['tile_id'] == current_tile) & 
+                (self.data_manager.region_df['unique_number'] == unique_num)
+            ]
             
-            # Update display
-            self.index = target_index
-            self.science_data = None
-            self.reference_data = None
-            self.display_images()
-            
-            logging.info(f"Jumped to image with unique number {unique_num} at index {target_index}")
-            
-            # Clear the entry box after successful jump
+            if not matching_images.empty:
+                # Get the file_index of the matching image
+                target_index = matching_images['file_index'].iloc[0]
+                
+                # Update index and let the main process handle the display update
+                self.index = target_index
+                self.next_image()  # This will trigger the normal image loading process
+                
+                logging.info(f"Jumped to image with unique number {unique_num} at index {target_index}")
+            else:
+                messagebox.showinfo("Not Found", 
+                                  f"Unique number {unique_num} not found in tile {current_tile}")
+                
+            # Clear the entry box after attempt
             self.unique_entry.delete(0, 'end')
             
-        except ValueError:
-            messagebox.showerror("Error", "Please enter a valid number")
         except Exception as e:
             logging.error(f"Error jumping to unique number: {e}")
             messagebox.showerror("Error", f"Failed to jump to unique number: {e}")
@@ -1992,26 +2071,57 @@ def main():
     """
     Main function to run the TransientTool application.
     """
-    # Initialize the root before loading the configuration to ensure logging works
-    root = Tk()
     try:
-        config = Config.load_config()
-    except Exception as e:
-        # Set up basic logging before config is loaded
+        # Set up basic logging before loading config
         logging.basicConfig(
             filename='transient_tool.log',
-            level=logging.ERROR,
-            format='%(asctime)s - %(levelname)s - %(message)s'
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
+            force=True  # Force reconfiguration of the logging
         )
-        logging.exception("Failed to load configuration.")
-        messagebox.showerror("Configuration Error", f"Failed to load configuration: {e}")
-        root.quit()
-        return
+        
+        logging.info("=" * 50)
+        logging.info("Starting Transient Tool Application")
+        logging.info("=" * 50)
+        
+        root = Tk()
+        config = Config.load_config()
+        
+        # Log important configuration settings
+        logging.info("-" * 50)
+        logging.info("Configuration Summary:")
+        logging.info(f"- Data Directory: {config.data_directory}")
+        logging.info(f"- File Type: {config.file_type}")
+        logging.info(f"- Output CSV: {config.output_csv_file}")
+        logging.info(f"- View Mode: {config.view_mode}")
+        logging.info(f"- Quick Start: {config.quick_start}")
+        logging.info(f"- Scale: {config.scale}")
+        if config.tile_ids:
+            logging.info(f"- Tile IDs: {', '.join(config.tile_ids)}")
+        else:
+            logging.info("- Tile IDs: Auto-detected")
+        logging.info("-" * 50)
+        
+        # Update logging configuration with settings from config
+        logging.getLogger().setLevel(getattr(logging, config.log_level))
+        for handler in logging.getLogger().handlers:
+            if isinstance(handler, logging.FileHandler):
+                handler.baseFilename = os.path.abspath(config.log_file)
+        
+        app = TransientTool(root, config)
+        root.mainloop()
+        
+        # After the application is closed, log the end of the session
+        logging.info("=" * 50)
+        logging.info("Transient Tool Application Closed")
+        logging.info("=" * 50)
 
-    app = TransientTool(root, config)
-    root.mainloop()
-
-
+    except Exception as e:
+        logging.exception("Failed to start application")
+        if 'root' in locals():
+            messagebox.showerror("Error", f"Failed to start application: {e}")
+            root.quit()
 
 if __name__ == "__main__":
     main()
