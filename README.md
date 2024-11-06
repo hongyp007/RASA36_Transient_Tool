@@ -29,7 +29,7 @@ The tool is designed to efficiently process large numbers of candidate detection
 The image format is either PNG or FITS.
 Python 3.10 or later is required.
 
-Required Python packages:
+### Required Python packages:
 - numpy
 - pandas 
 - astropy
