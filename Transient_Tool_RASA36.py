@@ -123,118 +123,125 @@ class Config:
         Raises:
             ValueError: If required settings are missing or invalid
         """
-        config = configparser.ConfigParser()
-        config.read(config_path)
+        try:
+            config = configparser.ConfigParser()
+            config.read(config_path)
 
-        def get_config_option(section: str, option: str, type_func: Any, default: Any) -> Any:
-            """
-            Get config option value, ignoring comments after #.
-            
-            Args:
-                section: Config section name
-                option: Option name within section
-                type_func: Type conversion function
-                default: Default value if option not found
+            def get_config_option(section: str, option: str, type_func: Any, default: Any) -> Any:
+                """
+                Get config option value, ignoring comments after #.
                 
-            Returns:
-                Converted option value or default
-            """
-            try:
-                # Get raw value and strip comments after #
-                value = config.get(section, option)
-                if '#' in value:
-                    value = value.split('#')[0].strip()
+                Args:
+                    section: Config section name
+                    option: Option name within section
+                    type_func: Type conversion function
+                    default: Default value if option not found
                     
-                # Handle special case for None values
-                if value.lower() == 'none':
-                    return None
+                Returns:
+                    Converted option value or default
+                """
+                try:
+                    # Get raw value and strip comments after #
+                    value = config.get(section, option)
+                    if '#' in value:
+                        value = value.split('#')[0].strip()
+                        
+                    # Handle special case for None values
+                    if value.lower() == 'none':
+                        return None
                     
-                # Handle boolean values specially
-                if type_func == bool:
-                    return value.lower() in ['true', '1', 'yes']
+                    # Handle boolean values specially
+                    if type_func == bool:
+                        return value.lower() in ['true', '1', 'yes']
                     
-                # Convert value to specified type
-                return type_func(value)
+                    # Convert value to specified type
+                    return type_func(value)
+                    
+                except (configparser.NoSectionError, configparser.NoOptionError):
+                    return default
                 
-            except (configparser.NoSectionError, configparser.NoOptionError):
-                return default
-            
-            except ValueError as e:
-                logging.warning(f"Error parsing {option} from config: {e}")
-                return default
+                except ValueError as e:
+                    logging.warning(f"Error parsing {option} from config: {e}")
+                    return default
 
-        # Load shortcuts
-        shortcuts = {}
-        if config.has_section('Shortcuts'):
-            for key in config.options('Shortcuts'):
-                shortcuts[key] = config.get('Shortcuts', key).strip()
+            # Load shortcuts
+            shortcuts = {}
+            if config.has_section('Shortcuts'):
+                for key in config.options('Shortcuts'):
+                    shortcuts[key] = config.get('Shortcuts', key).strip()
 
-        # Load mode settings
-        view_mode = get_config_option('Mode', 'view_mode', bool, False)
-        specific_view_mode = get_config_option('Mode', 'specific_view_mode', str, None)
+            # Load mode settings
+            view_mode = get_config_option('Mode', 'view_mode', bool, False)
+            specific_view_mode = get_config_option('Mode', 'specific_view_mode', str, None)
 
-        # Load tile IDs
-        raw_tile_ids = config.get('TileSettings', 'tile_ids', fallback='').split(',')
-        tile_ids = []
-        for tid in raw_tile_ids:
-            if tid.strip():
-                tile_id = DataManager.get_tile_id(tid.strip())
-                if tile_id:
-                    tile_ids.append(tile_id)
-                    
-        if not tile_ids:
-            raise ValueError("No valid tile IDs specified in config")
+            # Load tile IDs
+            raw_tile_ids = config.get('TileSettings', 'tile_ids', fallback='').split(',')
+            tile_ids = []
+            if any(tid.strip() for tid in raw_tile_ids):  # If tile_ids is not empty
+                for tid in raw_tile_ids:
+                    if tid.strip():
+                        tile_id = DataManager.get_tile_id(tid.strip())
+                        if tile_id:
+                            tile_ids.append(tile_id)
+                if not tile_ids:
+                    logging.warning("No valid tile IDs found in config, will auto-detect")
+            else:
+                logging.info("No tile IDs specified in config, will auto-detect")
 
-        # Load classification labels
-        classification_labels = [label.strip() for label in 
-                              config.get('Settings', 'classification_labels', fallback='').split(',')]
+            # Load classification labels
+            classification_labels = [label.strip() for label in 
+                                  config.get('Settings', 'classification_labels', fallback='').split(',')]
 
-        # Create config instance with all required parameters
-        config_obj = Config(
-            data_directory=get_config_option('Paths', 'data_directory', str, ''),
-            file_pattern=get_config_option('Paths', 'file_pattern', str, ''),
-            output_csv_file=get_config_option('Paths', 'output_csv_file', str, ''),
-            zoom_min=get_config_option('Settings', 'zoom_min', float, 1.0),
-            zoom_max=get_config_option('Settings', 'zoom_max', float, 10.0),
-            zoom_step=get_config_option('Settings', 'zoom_step', float, 0.1),
-            initial_zoom=get_config_option('Settings', 'initial_zoom', float, 1.0),
-            default_sci_ref_visible=get_config_option('Settings', 'default_sci_ref_visible',bool, True),
-            scale=get_config_option('Settings', 'scale', str, 'zscale').lower(),
-            vmin_subtracted=get_config_option('Settings', 'vmin_subtracted', str, 'median').lower(),
-            vmax_subtracted=get_config_option('Settings', 'vmax_subtracted', str, 'max').lower(),
-            vmin_science=get_config_option('Settings', 'vmin_science', str, 'median').lower(),
-            vmax_science=get_config_option('Settings', 'vmax_science', str, 'max').lower(),
-            vmin_reference=get_config_option('Settings', 'vmin_reference', str, 'median').lower(),
-            vmax_reference=get_config_option('Settings', 'vmax_reference', str, 'max').lower(),
-            log_file=get_config_option('Logging', 'log_file', str, 'transient_tool.log'),
-            log_level=get_config_option('Logging', 'log_level', str, 'INFO').upper(),
-            shortcuts=shortcuts,
-            file_type=get_config_option('Settings', 'file_type', str, 'fits').lower(),
-            tile_ids=tile_ids,
-            cache_size=get_config_option('TileSettings', 'cache_size', int, 100),
-            classification_labels=classification_labels,
-            cache_window=get_config_option('TileSettings', 'cache_window', int, 10),
-            preload_batch_size=get_config_option('TileSettings', 'preload_batch_size', int, 5),
-            view_mode=view_mode,
-            specific_view_mode=specific_view_mode
-        )
+            # Create config instance with all required parameters
+            config_obj = Config(
+                data_directory=get_config_option('Paths', 'data_directory', str, ''),
+                file_pattern=get_config_option('Paths', 'file_pattern', str, ''),
+                output_csv_file=get_config_option('Paths', 'output_csv_file', str, ''),
+                zoom_min=get_config_option('Settings', 'zoom_min', float, 1.0),
+                zoom_max=get_config_option('Settings', 'zoom_max', float, 10.0),
+                zoom_step=get_config_option('Settings', 'zoom_step', float, 0.1),
+                initial_zoom=get_config_option('Settings', 'initial_zoom', float, 1.0),
+                default_sci_ref_visible=get_config_option('Settings', 'default_sci_ref_visible',bool, True),
+                scale=get_config_option('Settings', 'scale', str, 'zscale').lower(),
+                vmin_subtracted=get_config_option('Settings', 'vmin_subtracted', str, 'median').lower(),
+                vmax_subtracted=get_config_option('Settings', 'vmax_subtracted', str, 'max').lower(),
+                vmin_science=get_config_option('Settings', 'vmin_science', str, 'median').lower(),
+                vmax_science=get_config_option('Settings', 'vmax_science', str, 'max').lower(),
+                vmin_reference=get_config_option('Settings', 'vmin_reference', str, 'median').lower(),
+                vmax_reference=get_config_option('Settings', 'vmax_reference', str, 'max').lower(),
+                log_file=get_config_option('Logging', 'log_file', str, 'transient_tool.log'),
+                log_level=get_config_option('Logging', 'log_level', str, 'INFO').upper(),
+                shortcuts=shortcuts,
+                file_type=get_config_option('Settings', 'file_type', str, 'fits').lower(),
+                tile_ids=tile_ids,  # 빈 리스트여도 괜찮음
+                cache_size=get_config_option('TileSettings', 'cache_size', int, 100),
+                classification_labels=classification_labels,
+                cache_window=get_config_option('TileSettings', 'cache_window', int, 10),
+                preload_batch_size=get_config_option('TileSettings', 'preload_batch_size', int, 5),
+                view_mode=view_mode,
+                specific_view_mode=specific_view_mode
+            )
 
-        # Validation of required fields
-        required_options = ['data_directory', 'file_pattern', 'output_csv_file']
-        for option in required_options:
-            if not getattr(config_obj, option):
-                raise ValueError(f"Missing required configuration option: {option} in section 'Paths'.")
+            # Validation of required fields
+            required_options = ['data_directory', 'file_pattern', 'output_csv_file']
+            for option in required_options:
+                if not getattr(config_obj, option):
+                    raise ValueError(f"Missing required configuration option: {option} in section 'Paths'.")
 
-        # Validate scale option
-        if config_obj.scale not in ['zscale', 'linear', 'log']:
-            logging.warning(f"Invalid scale '{config_obj.scale}' in configuration. Using 'linear' as default.")
-            config_obj.scale = 'linear'
+            # Validate scale option
+            if config_obj.scale not in ['zscale', 'linear', 'log']:
+                logging.warning(f"Invalid scale '{config_obj.scale}' in configuration. Using 'linear' as default.")
+                config_obj.scale = 'linear'
 
-        # Validate file_type option
-        if config_obj.file_type not in ['fits', 'png']:
-            raise ValueError("Invalid file_type option in configuration. Choose 'fits' or 'png'.")
+            # Validate file_type option
+            if config_obj.file_type not in ['fits', 'png']:
+                raise ValueError("Invalid file_type option in configuration. Choose 'fits' or 'png'.")
 
-        return config_obj
+            return config_obj
+
+        except Exception as e:
+            logging.exception(f"Error loading configuration: {e}")
+            raise
 
 class DataManager:
     """
@@ -346,33 +353,48 @@ class DataManager:
             file_data = []
             base_dir = self.config.data_directory
             
-            for tile_id in self.config.tile_ids:
-                pattern = self.config.file_pattern.replace('T*', tile_id)
-                full_pattern = os.path.join(base_dir, f"{pattern}*.com.*.sub.{self.config.file_type}")
+            tile_ids = self.config.tile_ids if self.config.tile_ids else self.get_all_tile_ids()
+            
+            for tile_id in tile_ids:
+                pattern = f"**/*{tile_id}*.com.*.sub.{self.config.file_type}"
+                full_pattern = os.path.join(base_dir, pattern)
+                files = glob.glob(full_pattern, recursive=True)
                 
-                sub_files = glob.glob(full_pattern)
-                
-                for filename in sub_files:
-                    unique_number = self.get_unique_number(filename)
-                    if unique_number is not None:
-                        # Skip if file already exists in CSV
-                        if existing_keys and (tile_id, unique_number) in existing_keys:
-                            continue
-                            
-                        file_data_dict = {
-                            'file_index': len(file_data),
-                            'tile_id': tile_id,
-                            'unique_number': unique_number,
-                            'Memo': '',
-                            'Scale': self.config.scale,
-                        }
-                        for label in self.config.classification_labels:
-                            file_data_dict[label] = 0
-                        file_data.append(file_data_dict)
+                if files:
+                    logging.info(f"Found {len(files)} files for tile {tile_id}")
+                    
+                    # Create temporary list for this tile's files
+                    tile_data = []
+                    for filename in files:
+                        unique_number = self.get_unique_number(filename)
+                        if unique_number is not None:
+                            # Skip if file already exists in CSV
+                            if existing_keys and (tile_id, unique_number) in existing_keys:
+                                continue
+                                
+                            file_data_dict = {
+                                'tile_id': tile_id,
+                                'unique_number': unique_number,
+                                'Memo': '',
+                                'Scale': ''
+                            }
+                            for label in self.config.classification_labels:
+                                file_data_dict[label] = 0
+                            tile_data.append(file_data_dict)
+                    
+                    # Sort tile_data by unique_number before adding to main list
+                    tile_data.sort(key=lambda x: x['unique_number'])
+                    file_data.extend(tile_data)
+                else:
+                    logging.info(f"No files found for tile {tile_id}")
+
+            # Add file_index after sorting
+            for i, data in enumerate(file_data):
+                data['file_index'] = i
 
             df = pd.DataFrame(file_data)
             if len(file_data) > 0:
-                logging.info(f"Found {len(df)} new files")
+                logging.info(f"Found {len(df)} new files across all tiles")
             return df
 
         except Exception as e:
@@ -614,6 +636,32 @@ class DataManager:
         except Exception as e:
             logging.error(f"Error cleaning cache: {e}")
 
+    def get_all_tile_ids(self):
+        """Scan directory to find all available tile IDs."""
+        try:
+            base_dir = self.config.data_directory
+            pattern = "**/*RASA36-T*-*.com.*.sub." + self.config.file_type
+            all_files = glob.glob(os.path.join(base_dir, pattern), recursive=True)
+            
+            # Extract tile IDs using regex
+            tile_ids = set()
+            for filepath in all_files:
+                match = re.search(r'RASA36-(T\d{5})-', filepath)
+                if match:
+                    tile_ids.add(match.group(1))
+            
+            if not tile_ids:
+                logging.warning("No tile IDs found in directory")
+                return []
+                
+            sorted_tile_ids = sorted(list(tile_ids))
+            logging.info(f"Found {len(sorted_tile_ids)} tile IDs: {', '.join(sorted_tile_ids)}")
+            return sorted_tile_ids
+            
+        except Exception as e:
+            logging.error(f"Error finding tile IDs: {e}")
+            return []
+
 class DataValidator:
     """Class to handle data validation."""
     
@@ -689,7 +737,8 @@ class ImageProcessor:
         self.image_cache = {}
         self.cache_size = config.cache_size
         self.cache_lock = threading.Lock()
-        
+        self.zscale = ZScaleInterval()
+
     def load_and_process_images(self, tile_id: str, unique_number: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Load and process all image types for a given identifier.
@@ -706,9 +755,9 @@ class ImageProcessor:
             paths = self._get_image_paths(tile_id, unique_number)
             
             # Load images
-            sub_data = self._load_single_image(paths['sub'][0]) if paths['sub'] else None
-            new_data = self._load_single_image(paths['new'][0]) if paths['new'] else None
-            ref_data = self._load_single_image(paths['ref'][0]) if paths['ref'] else None
+            sub_data = self._load_single_image(paths['sub']) if paths['sub'] else None
+            new_data = self._load_single_image(paths['new']) if paths['new'] else None
+            ref_data = self._load_single_image(paths['ref']) if paths['ref'] else None
             
             # Cache results
             self._update_cache(cache_key, (sub_data, new_data, ref_data))
@@ -721,39 +770,57 @@ class ImageProcessor:
             
     def _get_image_paths(self, tile_id: str, unique_number: int) -> dict:
         """Get paths for all image types."""
-        base_pattern = self.config.file_pattern.replace('T*', tile_id)
-        base_path = os.path.join(self.config.data_directory, f"{base_pattern}*.com.{unique_number}")
-        
-        return {
-            'sub': glob.glob(f"{base_path}.sub.{self.config.file_type}"),
-            'new': glob.glob(f"{base_path}.new.{self.config.file_type}"),
-            'ref': glob.glob(f"{base_path}.ref.{self.config.file_type}")
-        }
-        
+        try:
+            # First find the .sub file
+            base_pattern = f"**/*{tile_id}*.com.{unique_number}.sub.{self.config.file_type}"
+            sub_files = glob.glob(os.path.join(self.config.data_directory, base_pattern), recursive=True)
+            
+            if not sub_files:
+                raise FileNotFoundError(f"No subtracted image found for {tile_id} number {unique_number}")
+                
+            # Use the found sub file to construct paths for new and ref
+            sub_path = sub_files[0]
+            base_path = sub_path.replace(f".sub.{self.config.file_type}", "")
+            
+            return {
+                'sub': sub_path,
+                'new': f"{base_path}.new.{self.config.file_type}",
+                'ref': f"{base_path}.ref.{self.config.file_type}"
+            }
+            
+        except Exception as e:
+            logging.error(f"Error getting image paths: {e}")
+            raise
+            
     def _load_single_image(self, filepath: str) -> np.ndarray:
         """Load a single image file."""
         try:
             if not os.path.exists(filepath):
-                raise FileNotFoundError(f"Image file not found: {filepath}")
+                logging.error(f"File not found: {filepath}")
+                return None
 
-            elif self.config.file_type == 'fits':
-                with fits.open(filepath) as hdul:
-                    data = hdul[0].data
-                    if data is None:
-                        raise ValueError(f"No data found in FITS file: {filepath}")
+            if self.config.file_type == 'fits':
+                try:
+                    with fits.open(filepath) as hdul:
+                        data = hdul[0].data
+                        if data is None:
+                            logging.error(f"No data in FITS file: {filepath}")
+                            return None
+                        return data.astype(np.float32)  # 데이터 타입 변환
+                except Exception as e:
+                    logging.error(f"Error reading FITS file {filepath}: {e}")
+                    return None
+            else:  # PNG case
+                try:
+                    data = plt.imread(filepath)
                     return data
-            elif self.config.file_type == 'png':
-                data = plt.imread(filepath)
-                if data is None:
-                    raise ValueError(f"No data found in PNG file: {filepath}")
-                return data
-            
-            else:
-                raise ValueError(f"Unsupported file type: {self.config.file_type}")
-                
+                except Exception as e:
+                    logging.error(f"Error reading PNG file {filepath}: {e}")
+                    return None
+
         except Exception as e:
-            logging.error(f"Error loading image {filepath}: {e}")
-            raise
+            logging.error(f"Error in _load_single_image for {filepath}: {e}")
+            return None
             
     def _update_cache(self, key: str, value: Tuple[np.ndarray, np.ndarray, np.ndarray]):
         """Thread-safe cache update."""
@@ -786,7 +853,7 @@ class ImageProcessor:
             
             # Get actual min/max values based on settings
             if self.config.scale == 'zscale':
-                interval = ZScaleInterval()
+                interval = self.zscale
                 v_min, v_max = interval.get_limits(image)
                 return colors.Normalize(vmin=v_min, vmax=v_max)
                 
@@ -845,46 +912,40 @@ class TransientTool:
         sci_ref_visible (bool): Science/Reference image visibility flag
     """
     def __init__(self, master: Tk, config: Config):
-        """Initialize the TransientTool."""
+        """Initialize the TransientTool application."""
         self.master = master
         self.config = config
-        self.master.title("Searching Transient Tool")
-
-        # Initialize logging
-        self.setup_logging()
-
-        try:
-            # Initialize helpers
-            self.data_validator = DataValidator(config)
-
-            # Data Manager initialization
-            self.data_manager = DataManager(config)
-            self.index = self.data_manager.index  # Use DataManager's index
-            self.num_images = len(self.data_manager.region_df)
-            
-            # Variables
-            self.zoom_level = self.config.initial_zoom
-            self.sci_ref_visible = self.config.default_sci_ref_visible
-            self.current_memo = ''
-            self.science_data = None
-            self.reference_data = None
-            self.memo_editing = False
-            self.classification_buttons = {}
-
-            # Setup UI and initialize
-            self.setup_ui()
-            self.bind_shortcuts()
+        
+        # Initialize image processor
+        self.image_processor = ImageProcessor(config)
+        
+        # Initialize zoom and display attributes
+        self.zoom_level = self.config.initial_zoom
+        self.original_size = [1, 1]  # Will be updated when first image is loaded
+        self.zoom_center = [0.5, 0.5]  # Center point for zoom
+        self.view_size = [1/self.zoom_level, 1/self.zoom_level]
+        
+        # Initialize data attributes
+        self.index = 0
+        self.science_data = None
+        self.reference_data = None
+        self.sci_ref_visible = self.config.default_sci_ref_visible
+        
+        # Initialize DataManager
+        self.data_manager = DataManager(config)
+        self.num_images = len(self.data_manager.region_df)
+        
+        # Set up the main window
+        self.master.title("Transient Detection Tool")
+        self.setup_ui()
+        
+        # Start from first unclassified image if not in view mode
+        if not self.config.view_mode:
+            self.goto_unclassified()
+        else:
             self.display_images()
-            self.init_mode_settings()
             
-            # Initialize ImageProcessor
-            self.image_processor = ImageProcessor(config)
-            
-        except Exception as e:
-            logging.error(f"Critical initialization error: {e}")
-            messagebox.showerror("Critical Error", f"Failed to initialize: {e}")
-            self.master.quit()
-            sys.exit(1)
+        logging.info(f"Initializing in {'view' if self.config.view_mode else 'normal'} mode")
 
     def setup_logging(self):
         """
@@ -1139,8 +1200,12 @@ class TransientTool:
         tile_frame = Frame(goto_inner_frame)
         tile_frame.pack(side='left', padx=20)
         Label(tile_frame, text="Go to Tile ID:").pack(side='left', padx=2)
-        sorted_tile_ids = sorted(self.config.tile_ids)
-        self.tile_combobox = ttk.Combobox(tile_frame, values=sorted_tile_ids, width=10)
+        
+        # Get unique tile IDs from DataFrame and sort them
+        available_tiles = sorted(self.data_manager.region_df['tile_id'].unique())
+        self.tile_combobox = ttk.Combobox(tile_frame, values=available_tiles, width=10)
+        if available_tiles:  # Set default value if available
+            self.tile_combobox.set(available_tiles[0])
         self.tile_combobox.pack(side='left', padx=2)
         Button(tile_frame, text="Go", command=self.goto_tile_id).pack(side='left', padx=2)
         
@@ -1467,7 +1532,7 @@ class TransientTool:
                         fontsize=14, fontweight='bold')
 
             # Update scale labels
-            self.update_scale_labels()
+            self.update_scale_labels(sub_data, new_data, ref_data)
 
             # Display science image
             if new_data is not None:
@@ -1540,6 +1605,16 @@ class TransientTool:
             # Cleanup cache
             self.data_manager.cleanup_cache(self.index)
             
+            # Update scale in DataFrame after successful image loading
+            current_row = self.data_manager.region_df.iloc[self.index]
+            if current_row['Scale'] == '':
+                self.data_manager.region_df.at[self.index, 'Scale'] = (
+                    'png' if self.config.file_type == 'png'
+                    else self.config.scale if self.config.file_type == 'fits'
+                    else ''
+                )
+                self.data_manager.save_dataframe()
+            
         except Exception as e:
             logging.error(f"Error in display_images: {e}")
 
@@ -1599,12 +1674,9 @@ class TransientTool:
             logging.error(f"Error resetting zoom: {e}")
 
     @handle_exceptions
-    def update_scale_labels(self):
+    def update_scale_labels(self, sub_data, new_data, ref_data):
         """Update the scale, vmin, vmax labels with current settings."""
         try:
-            # Get current data statistics
-            sub_data, new_data, ref_data = self.data_manager.load_image_data(self.index)
-            
             if self.config.file_type == 'fits':
                 # Update labels for FITS files
                 if sub_data is not None:
@@ -1647,7 +1719,10 @@ class TransientTool:
         """Load and display memo for the current image."""
         try:
             current_row = self.data_manager.region_df.iloc[self.index]
-            memo = current_row.get('Memo', '').strip()
+            # Convert memo to string and handle NaN/float cases
+            memo = str(current_row.get('Memo', ''))
+            if memo == 'nan':
+                memo = ''
             self.memo_text.config(state='normal')
             self.memo_text.delete('1.0', 'end')
             self.memo_text.insert('end', memo)
