@@ -1655,8 +1655,14 @@ class TransientTool:
                 )
                 self.data_manager.save_dataframe()
             
+            # Update tile combobox to match current tile_id and unfocus
+            current_tile = self.data_manager.region_df.iloc[self.index]['tile_id']
+            self.tile_combobox.set(current_tile)
+            self.master.focus_set()  # Remove focus from combobox
+            
         except Exception as e:
             logging.error(f"Error in display_images: {e}")
+            messagebox.showerror("Error", f"Failed to display images: {e}")
 
     def update_zoom(self):
         """Update the display with current zoom level."""
@@ -2048,24 +2054,29 @@ class TransientTool:
             ]
             
             if not matching_images.empty:
-                # Get the file_index of the matching image
-                target_index = matching_images['file_index'].iloc[0]
+                # Get the actual index from the DataFrame
+                target_index = matching_images.index[0]
                 
-                # Update index and let the main process handle the display update
+                # Update display
                 self.index = target_index
-                self.next_image()  # This will trigger the normal image loading process
+                self.science_data = None
+                self.reference_data = None
+                self.display_images()
                 
                 logging.info(f"Jumped to image with unique number {unique_num} at index {target_index}")
             else:
                 messagebox.showinfo("Not Found", 
                                   f"Unique number {unique_num} not found in tile {current_tile}")
-                
-            # Clear the entry box after attempt
+            
+            # Clear and unfocus the entry box
             self.unique_entry.delete(0, 'end')
+            self.master.focus_set()
             
         except Exception as e:
             logging.error(f"Error jumping to unique number: {e}")
             messagebox.showerror("Error", f"Failed to jump to unique number: {e}")
+
+
 
 def main():
     """
