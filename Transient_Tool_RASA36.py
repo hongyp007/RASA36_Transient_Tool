@@ -616,71 +616,110 @@ class DataManager:
             logging.error(f"Error in load_image_data: {e}")
             raise
 
-    def preload_images(self, start_index: int):
-        """
-        Preload next batch of images in background thread.
-        
-        Args:
-            start_index: Starting index for preloading
-        """
+    def start_preloading(self, current_index: int):
+        """Start preloading images in a background thread."""
+        try:
+            # Cancel any existing preload thread
+            if hasattr(self, 'preload_thread') and self.preload_thread.is_alive():
+                with self.preload_lock:
+                    self.preload_thread = None
+            
+            # Start new preload thread
+            self.preload_thread = threading.Thread(
+                target=self.preload_images,
+                args=(current_index,),
+                daemon=True
+            )
+            self.preload_thread.start()
+            
+        except Exception as e:
+            logging.error(f"Error starting preload thread: {e}")
+
+    def preload_images(self, current_index: int):
+        """Preload next batch of images."""
         try:
             with self.preload_lock:
-                # Calculate preload range based on config
-                end_index = min(start_index + self.preload_batch_size, len(self.region_df))
+                # Calculate range of indices to preload
+                start_idx = current_index + 1
+                end_idx = min(
+                    start_idx + self.preload_batch_size,
+                    len(self.region_df)
+                )
                 
-                # Only preload images within cache window
-                window_end = min(len(self.region_df), start_index + self.cache_window)
-                end_index = min(end_index, window_end)
-                
-                for idx in range(start_index, end_index):
-                    current_row = self.region_df.iloc[idx]
-                    cache_key = f"{current_row['tile_id']}_{current_row['unique_number']}"
-                    
-                    if cache_key not in self.image_processor.image_cache:
-                        self.image_processor.load_and_process_images(
-                            current_row['tile_id'], 
-                            current_row['unique_number']
-                        )
-                        
+                # Preload in background
+                for idx in range(start_idx, end_idx):
+                    if idx not in self.image_cache:
+                        try:
+                            current_row = self.region_df.iloc[idx]
+                            tile_id = current_row['tile_id']
+                            unique_number = current_row['unique_number']
+                            cache_key = f"{tile_id}_{unique_number}"
+                            
+                            if cache_key not in self.image_processor.image_cache:
+                                self.image_processor.load_and_process_images(
+                                    tile_id,
+                                    unique_number
+                                )
+                        except Exception as e:
+                            logging.error(f"Error preloading image at index {idx}: {e}")
+                            continue
+                            
         except Exception as e:
-            logging.error(f"Error preloading images: {e}")
+            logging.error(f"Error in preload_images: {e}")
 
-    def start_preloading(self, current_index: int):
-        """Start background thread for preloading images."""
-        if self.preload_thread and self.preload_thread.is_alive():
-            return
+    def calculate_progress(self) -> dict:
+        """Calculate progress statistics for total and per-tile."""
+        try:
+            progress_stats = {}
             
-        self.preload_thread = threading.Thread(
-            target=self.preload_images,
-            args=(current_index + 1,)
-        )
-        self.preload_thread.daemon = True
-        self.preload_thread.start()
+            # Calculate total progress
+            total_images = len(self.region_df)
+            total_classified = len(self.region_df[
+                self.region_df[self.config.classification_labels].any(axis=1)
+            ])
+            total_percent = (total_classified / total_images * 100) if total_images > 0 else 0
+            
+            progress_stats['total'] = {
+                'classified': total_classified,
+                'total': total_images,
+                'percent': total_percent
+            }
+            
+            # Calculate progress by tile
+            progress_stats['tiles'] = {}
+            for tile_id in sorted(self.region_df['tile_id'].unique()):
+                tile_df = self.region_df[self.region_df['tile_id'] == tile_id]
+                tile_total = len(tile_df)
+                tile_classified = len(tile_df[tile_df[self.config.classification_labels].any(axis=1)])
+                tile_percent = (tile_classified / tile_total * 100) if tile_total > 0 else 0
+                
+                progress_stats['tiles'][tile_id] = {
+                    'classified': tile_classified,
+                    'total': tile_total,
+                    'percent': tile_percent
+                }
+            
+            return progress_stats
+            
+        except Exception as e:
+            logging.error(f"Error calculating progress: {e}")
 
     def cleanup_cache(self, current_index: int):
-        """
-        Remove images outside cache window from memory.
-        
-        Args:
-            current_index: Current image index
-        """
+        """Remove images outside cache window from memory."""
         try:
-            with self.preload_lock:
+            with self.cache_lock:
                 window_start = max(0, current_index - self.cache_window)
                 window_end = min(len(self.region_df), current_index + self.cache_window)
                 
                 # Get indices within window
                 valid_indices = set(range(window_start, window_end + 1))
                 
-                # Get all cached keys
-                cache_keys = list(self.image_processor.image_cache.keys())
-                
                 # Remove items outside window
-                for key in cache_keys:
+                keys_to_remove = []
+                for key in self.image_processor.image_cache:
                     tile_id, unique_number = key.split('_')
                     unique_number = int(unique_number)
                     
-                    # Find index for this key using file_index
                     matching_rows = self.region_df[
                         (self.region_df['tile_id'] == tile_id) & 
                         (self.region_df['unique_number'] == unique_number)
@@ -689,9 +728,12 @@ class DataManager:
                     if not matching_rows.empty:
                         idx = matching_rows.index[0]
                         if idx not in valid_indices:
-                            del self.image_processor.image_cache[key]
-                            
-                # Log cache status
+                            keys_to_remove.append(key)
+                
+                # Remove cached items outside window
+                for key in keys_to_remove:
+                    del self.image_processor.image_cache[key]
+                    
                 logging.debug(f"Cache size after cleanup: {len(self.image_processor.image_cache)}")
                 
         except Exception as e:
@@ -1232,8 +1274,7 @@ class TransientTool:
         self.tile_combobox.pack(side='left', padx=2)
         
         # Bind combobox selection to goto_tile_id
-        self.tile_combobox.bind('<<ComboboxSelected>>', 
-                              lambda e: self.goto_tile_id())
+        self.tile_combobox.bind('<<ComboboxSelected>>', self.goto_tile_id)
         
         # Jump to Unique Number controls
         unique_frame = Frame(goto_inner_frame)
@@ -1305,7 +1346,44 @@ class TransientTool:
             )
             button.grid(row=0, column=i, padx=5, pady=2, sticky='ew')
             self.classification_buttons[label] = button
-    
+
+    @handle_exceptions
+    def goto_tile_id(self, event=None):
+        """Jump to the first image of the selected tile ID."""
+        try:
+            selected_tile = self.tile_combobox.get()
+            if not selected_tile:
+                messagebox.showwarning("Warning", "Please select a tile ID")
+                return
+                
+            # Find first image with selected tile ID using data_manager's region_df
+            tile_images = self.data_manager.region_df[
+                self.data_manager.region_df['tile_id'] == selected_tile
+            ]
+            
+            if tile_images.empty:
+                messagebox.showwarning("Warning", f"No images found for tile {selected_tile}")
+                return
+                
+            # Get the index of the first image for this tile
+            first_tile_index = tile_images.index[0]
+            
+            # Update display
+            self.index = first_tile_index
+            self.science_data = None
+            self.reference_data = None
+            self.display_images()
+            
+            # Remove focus from combobox without text selection
+            self.master.focus_set()
+            self.tile_combobox.selection_clear()
+            
+            logging.info(f"Jumped to first image of tile {selected_tile} at index {first_tile_index}")
+            
+        except Exception as e:
+            logging.error(f"Error jumping to tile ID: {e}")
+            messagebox.showerror("Error", f"Failed to jump to tile: {e}")
+
     def goto_unclassified(self):
         """Find and navigate to the first unclassified image."""
         try:
@@ -1501,39 +1579,41 @@ class TransientTool:
             logging.error(f"Error calculating progress stats: {e}")
             raise
 
-    def update_progress(self):
-        """Update progress information with enhanced statistics by tile_id."""
+    def update_progress_display(self):
+        """Update progress information display in GUI."""
         try:
-            # Get statistics
-            stats = self._update_progress_stats()
+            # Get progress statistics from DataManager
+            progress_stats = self.data_manager.calculate_progress()
             
-            # Update progress bar with total progress
-            self.progress_var.set(int(stats['overall_progress']))
+            if not progress_stats:
+                return
             
-            # Update status text with total and per-tile progress
-            status_text = (f"Total Progress: {stats['overall_progress']:.1f}% "
-                      f"({stats['total_classified']}/{stats['total_images']})\n\n"
-                      f"Progress by Tile:\n"
-                      f"{'=' * 30}\n")
-                      
-            # Sort tile_ids for consistent display
-            sorted_tiles = sorted(stats['tile_stats'].keys())
-            for tile_id in sorted_tiles:
-                tile_stat = stats['tile_stats'][tile_id]
-                if tile_stat['total'] > 0:  # Only show tiles that have images
-                    status_text += (f"{tile_id}: {tile_stat['percent']:.1f}% "
-                              f"({tile_stat['classified']}/{tile_stat['total']})\n")
+            # Format total progress
+            total = progress_stats['total']
+            progress_text = (f"Total Progress: {total['classified']}/{total['total']} "
+                           f"({total['percent']:.1f}%)\n\n")
             
-            # Update the status text widget
-            if hasattr(self, 'status_text'):
-                self.status_text.config(state='normal')
-                self.status_text.delete('1.0', 'end')
-                self.status_text.insert('1.0', status_text)
-                self.status_text.config(state='disabled')
+            # Format progress by tile
+            progress_text += "Progress by Tile:\n"
+            for tile_id, stats in progress_stats['tiles'].items():
+                progress_text += (f"{tile_id}: {stats['classified']}/{stats['total']} "
+                                f"({stats['percent']:.1f}%)\n")
+            
+            # Update status text widget
+            self.status_text.config(state='normal')
+            self.status_text.delete('1.0', 'end')
+            self.status_text.insert('1.0', progress_text)
+            self.status_text.config(state='disabled')
+            
+            # Update progress bar if needed
+            total_percent = total['percent']
+            self.progress_var.set(int(total_percent))
+            style = Style()
+            style.configure('text.Horizontal.TProgressbar', 
+                          text=f'{total_percent:.1f}%')
             
         except Exception as e:
-            logging.error(f"Error updating progress: {e}")
-            raise
+            logging.error(f"Error updating progress display: {e}")
 
     @handle_exceptions
     def display_images(self):
@@ -1633,8 +1713,8 @@ class TransientTool:
             # Update the canvas
             self.canvas.draw()
             
-            # Update progress
-            self.update_progress()
+            # Update progress display
+            self.update_progress_display()
             
             # Load memo for current image
             self.load_memo(unique_number)
@@ -1917,7 +1997,7 @@ class TransientTool:
     def after_classification_save(self):
         """Called after classification is saved successfully."""
         self.hide_saving_indicator()
-        self.update_progress()
+        self.update_progress_display()
         self.next_image()
 
     def hide_saving_indicator(self):
@@ -1998,38 +2078,6 @@ class TransientTool:
             logging.info(f"Filtered to {self.num_images} images with classification "
                         f"'{self.config.specific_view_mode}'")
             
-    def goto_tile_id(self):
-        """Jump to the first image of the selected tile ID."""
-        try:
-            selected_tile = self.tile_combobox.get()
-            if not selected_tile:
-                messagebox.showwarning("Warning", "Please select a tile ID")
-                return
-                
-            # Find first image with selected tile ID using file_index
-            tile_images = self.data_manager.region_df[
-                self.data_manager.region_df['tile_id'] == selected_tile
-            ]
-            
-            if tile_images.empty:
-                messagebox.showwarning("Warning", f"No images found for tile {selected_tile}")
-                return
-                
-            # Get the file_index of the first image for this tile
-            first_tile_index = tile_images['file_index'].iloc[0]
-            
-            # Update display
-            self.index = first_tile_index
-            self.science_data = None
-            self.reference_data = None
-            self.display_images()
-            
-            logging.info(f"Jumped to first image of tile {selected_tile} at index {first_tile_index}")
-            
-        except Exception as e:
-            logging.error(f"Error jumping to tile ID: {e}")
-            messagebox.showerror("Error", f"Failed to jump to tile: {e}")
-   
     def goto_unique_number(self):
         """Go to specific unique number within current tile."""
         try:
