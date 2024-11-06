@@ -1,8 +1,8 @@
 """
 Transient Detection Tool
-Version: 7.2
+Version: 1.2.0
 Author: YoungPyo Hong
-Date: 2024-11-05
+Date: 2024-11-06
 
 A GUI application for viewing and classifying astronomical transient candidates.
 Supports FITS and PNG image formats with configurable display settings and 
@@ -493,9 +493,8 @@ class DataManager:
             # Assign back to self.region_df
             self.region_df = df
             
-            # Only save if not in quick_start mode
-            if not self.config.quick_start:
-                self.save_dataframe()
+            # Save DataFrame to CSV
+            self.save_dataframe()
             
             logging.info(f"DataFrame initialized with {len(self.region_df)} rows")
 
@@ -562,9 +561,9 @@ class DataManager:
             total_dict = {
                 'file_index': -1,
                 'tile_id': 'Total',
-                'unique_number': len(self.config.tile_ids),
+                'unique_number': len(df_to_save['tile_id'].unique()),
                 'Memo': f"{total_processed}/{total_images}",
-                'Scale': f"{percent_processed:.1f}%"
+                'Scale': f"{percent_processed:.2f}%"
             }
             total_dict.update(totals)
 
@@ -1028,14 +1027,20 @@ class TransientTool:
         self.zoom_center = [0.5, 0.5]  # Center point for zoom
         self.view_size = [1/self.zoom_level, 1/self.zoom_level]
         
+        # Initialize classification buttons dictionary
+        self.classification_buttons = {}
+        
         # Initialize data attributes
-        # Initialize data manager first before accessing its index
         self.data_manager = DataManager(config)
         self.index = self.data_manager.index
         self.num_images = len(self.data_manager.region_df)
         self.science_data = None
         self.reference_data = None
         self.sci_ref_visible = self.config.default_sci_ref_visible
+        
+        # Preload initial batch of images before UI setup
+        initial_index = self.data_manager.get_starting_index()
+        self.data_manager.start_preloading(initial_index)
         
         # Set up the main window
         self.master.title("Transient Detection Tool")
@@ -1591,13 +1596,13 @@ class TransientTool:
             # Format total progress
             total = progress_stats['total']
             progress_text = (f"Total Progress: {total['classified']}/{total['total']} "
-                           f"({total['percent']:.1f}%)\n\n")
+                           f"({total['percent']:.2f}%)\n\n")
             
             # Format progress by tile
             progress_text += "Progress by Tile:\n"
             for tile_id, stats in progress_stats['tiles'].items():
                 progress_text += (f"{tile_id}: {stats['classified']}/{stats['total']} "
-                                f"({stats['percent']:.1f}%)\n")
+                                f"({stats['percent']:.2f}%)\n")
             
             # Update status text widget
             self.status_text.config(state='normal')
@@ -1610,7 +1615,7 @@ class TransientTool:
             self.progress_var.set(int(total_percent))
             style = Style()
             style.configure('text.Horizontal.TProgressbar', 
-                          text=f'{total_percent:.1f}%')
+                          text=f'{total_percent:.2f}%')
             
         except Exception as e:
             logging.error(f"Error updating progress display: {e}")
