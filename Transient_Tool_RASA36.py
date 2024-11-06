@@ -1,6 +1,6 @@
 """
 Transient Detection Tool
-Version: 1.2.0
+Version: 1.0.0
 Author: YoungPyo Hong
 Date: 2024-11-06
 
