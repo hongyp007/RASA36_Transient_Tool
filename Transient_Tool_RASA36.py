@@ -5,8 +5,13 @@ Author: YoungPyo Hong
 Date: 2024-11-06
 
 A GUI application for viewing and classifying astronomical transient candidates.
-Supports FITS and PNG image formats with configurable display settings and 
-classification categories.
+This tool provides:
+- FITS and PNG image support
+- Configurable display settings
+- Classification categories
+- Image caching and preloading
+- Progress tracking
+- Keyboard shortcuts
 """
 # Standard library imports
 import glob
@@ -34,7 +39,17 @@ from tkinter.ttk import Progressbar, Style
 
 
 def handle_exceptions(func):
-    """Decorator to handle exceptions and show error messages in user-facing methods."""
+    """
+    Decorator to handle exceptions in user-facing methods.
+    
+    Catches any exceptions, logs them, and displays error messages to the user.
+    
+    Args:
+        func: The function to wrap
+        
+    Returns:
+        Wrapped function that handles exceptions gracefully
+    """
     def wrapper(self, *args, **kwargs):
         try:
             return func(self, *args, **kwargs)
@@ -48,33 +63,14 @@ class Config:
     """
     Configuration settings for the TransientTool application.
     
-    Attributes:
-        data_directory (str): Base directory containing image files
-        file_pattern (str): Pattern for matching image files
-        output_csv_file (str): Path to save classification results
-        zoom_min (float): Minimum zoom level
-        zoom_max (float): Maximum zoom level
-        zoom_step (float): Zoom increment/decrement step
-        initial_zoom (float): Default zoom level on startup
-        default_sci_ref_visible (bool): Show reference image by default
-        scale (str): Image scaling type ('zscale', 'linear', 'log')
-        vmin_subtracted (str): Minimum value setting for subtracted images
-        vmax_subtracted (str): Maximum value setting for subtracted images
-        vmin_science (str): Minimum value setting for science images
-        vmax_science (str): Maximum value setting for science images
-        vmin_reference (str): Minimum value setting for reference images
-        vmax_reference (str): Maximum value setting for reference images
-        log_file (str): Path to log file
-        log_level (str): Logging level
-        shortcuts (Dict[str, str]): Keyboard shortcuts mapping
-        file_type (str): Image file type ('fits' or 'png')
-        tile_ids (List[str]): List of tile IDs to process
-        cache_size (int): Maximum number of images to cache
-        classification_labels (List[str]): Available classification categories
-        view_mode (bool): View-only mode flag
-        specific_view_mode (Optional[str]): Specific classification view filter
-        cache_window (int): Cache window size
-        preload_batch_size (int): Preload batch size
+    This class manages all configuration parameters loaded from config.ini,
+    providing type hints and validation for each setting.
+    
+    Key Features:
+    - Type validation for all settings
+    - Default values for optional parameters
+    - Configuration file loading and parsing
+    - Logging setup
     """
     data_directory: str
     file_pattern: str
@@ -114,11 +110,18 @@ class Config:
         """
         Load and validate configuration settings from INI file.
         
+        Performs the following:
+        1. Reads the INI file
+        2. Validates required settings
+        3. Sets default values for optional settings
+        4. Configures logging
+        5. Validates data types and value ranges
+        
         Args:
             config_path: Path to configuration file
             
         Returns:
-            Config object with loaded settings
+            Config object with validated settings
             
         Raises:
             ValueError: If required settings are missing or invalid
@@ -261,24 +264,30 @@ class DataManager:
     """
     Handles data loading, processing and persistence for astronomical images.
     
-    Manages the loading, processing, and saving of image data and classifications.
-    Maintains a DataFrame of all images and their metadata.
+    Key responsibilities:
+    1. Image data loading and caching
+    2. Classification data management
+    3. Progress tracking
+    4. File operations (CSV read/write)
+    5. Cache management
     
-    Attributes:
-        config (Config): Configuration settings
-        file_lock (threading.Lock): Thread lock for file operations
-        region_df (pd.DataFrame): DataFrame containing image metadata and classifications
-        image_processor (ImageProcessor): Handler for image processing operations
-        data_validator (DataValidator): Validator for data integrity
-        index (int): Current image index
-        cache_window (int): Cache window size
-        preload_batch_size (int): Preload batch size
-        preload_thread (threading.Thread): Background thread for preloading images
-        preload_lock (threading.Lock): Thread lock for preloading images
+    The DataManager maintains a thread-safe environment for concurrent operations
+    and implements efficient caching strategies for optimal performance.
     """
 
     def __init__(self, config: Config):
-        """Initialize DataManager with configuration."""
+        """
+        Initialize DataManager with configuration.
+        
+        Sets up:
+        - Data structures for image and metadata management
+        - Thread locks for concurrent operations
+        - Cache initialization
+        - Helper components (ImageProcessor, DataValidator)
+        
+        Args:
+            config: Configuration settings
+        """
         # Configuration and basic attributes
         self.config = config
         self.region_df = None
@@ -829,14 +838,15 @@ class ImageProcessor:
     """
     Handles image processing operations and caching.
     
-    Provides methods for loading, processing, and caching astronomical images.
-    Handles different file types (FITS/PNG) and applies appropriate scaling.
+    Key features:
+    1. FITS and PNG image support
+    2. Image scaling (zscale, linear, log)
+    3. Normalization and value range management
+    4. Thread-safe caching
+    5. Memory optimization
     
-    Attributes:
-        config (Config): Configuration settings
-        image_cache (Dict): Cache of loaded images
-        cache_size (int): Maximum number of images to cache
-        cache_lock (threading.Lock): Thread lock for cache operations
+    The ImageProcessor ensures efficient image loading and processing
+    while maintaining memory usage within configured limits.
     """
     def __init__(self, config: Config):
         self.config = config
@@ -993,21 +1003,48 @@ class ImageProcessor:
             logging.error(f"Error validating value: {e}")
             raise ValueError(f"Invalid value: {value}")
 
+    def load_image(self, tile_id: str, unique_number: int, image_type: str) -> np.ndarray:
+        """
+        Load and process a single image with caching.
+        
+        Args:
+            tile_id: Identifier for the image tile
+            unique_number: Unique number within the tile
+            image_type: Type of image ('sub', 'new', or 'ref')
+            
+        Returns:
+            np.ndarray: Processed image data
+        """
+        cache_key = f"{tile_id}_{unique_number}_{image_type}"
+        
+        # Check cache first
+        if cache_key in self.image_cache:
+            return self.image_cache[cache_key]
+        
+        # Load and process image
+        filepath = self._get_image_path(tile_id, unique_number, image_type)
+        image_data = self._load_single_image(filepath)
+        
+        # Cache result
+        if image_data is not None:
+            self.image_cache[cache_key] = image_data
+            
+        return image_data
+
 class TransientTool:
     """
     GUI application for classifying transient astronomical objects.
     
-    Provides a graphical interface for viewing and classifying astronomical images,
-    with support for image navigation, zooming, and classification management.
+    Key features:
+    1. Interactive image display with zoom
+    2. Classification management
+    3. Progress tracking
+    4. Keyboard shortcuts
+    5. Memo management
     
-    Attributes:
-        master (Tk): Root Tkinter window
-        config (Config): Configuration settings
-        data_manager (DataManager): Data management handler
-        image_processor (ImageProcessor): Image processing handler
-        index (int): Current image index
-        zoom_level (float): Current zoom level
-        sci_ref_visible (bool): Science/Reference image visibility flag
+    The TransientTool provides a user-friendly interface for viewing
+    and classifying astronomical transient candidates with support
+    for various image types and display configurations.
     """
     def __init__(self, master: Tk, config: Config):
         """Initialize the TransientTool application."""
@@ -1559,37 +1596,6 @@ class TransientTool:
         # Bind keyboard events to the shortcut handler
         self.master.bind('<Key>', handle_shortcut)
 
-    def _update_progress_stats(self) -> dict:
-        """Calculate progress statistics. Separated from UI updates."""
-        try:
-            stats = {}
-            total_classified = 0
-            total_images = len(self.data_manager.region_df)
-            
-            # Calculate statistics for each tile
-            for tile_id in self.config.tile_ids:
-                tile_data = self.data_manager.region_df[
-                    self.data_manager.region_df['tile_id'] == tile_id
-                ]
-                classified = tile_data[self.config.classification_labels].any(axis=1).sum()
-                total = len(tile_data)
-                stats[tile_id] = {
-                    'classified': classified,
-                    'total': total,
-                    'percent': (classified / total * 100) if total > 0 else 0
-                }
-                total_classified += classified
-                
-            return {
-                'tile_stats': stats,
-                'total_classified': total_classified,
-                'total_images': total_images,
-                'overall_progress': (total_classified / total_images * 100) if total_images > 0 else 0
-            }
-            
-        except Exception as e:
-            logging.error(f"Error calculating progress stats: {e}")
-            raise
 
     def update_progress_display(self):
         """Update progress information display in GUI."""
@@ -1631,6 +1637,16 @@ class TransientTool:
     def display_images(self):
         """
         Display current set of images with proper scaling and normalization.
+        
+        Process flow:
+        1. Load image data (from cache if available)
+        2. Apply appropriate scaling and normalization
+        3. Update display with new images
+        4. Configure zoom and view parameters
+        5. Update UI elements (progress, memo, etc.)
+        
+        Raises:
+            ValueError: If image display fails
         """
         try:
             if not hasattr(self, '_current_index') or self._current_index != self.index:
@@ -1725,11 +1741,11 @@ class TransientTool:
             # Load memo for current image
             self.load_memo(current_row['unique_number'])
             
+            # Explicitly manage cache
+            self.data_manager.cleanup_cache(self.index)
+            
             # Start preloading next batch
             self.data_manager.start_preloading(self.index)
-            
-            # Cleanup cache
-            self.data_manager.cleanup_cache(self.index)
             
             # Update scale in DataFrame after successful image loading
             current_row = self.data_manager.region_df.iloc[self.index]
