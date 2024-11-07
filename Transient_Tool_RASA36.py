@@ -13,7 +13,6 @@ import glob
 import logging
 import os
 import re
-import sys
 import threading
 import configparser
 from dataclasses import dataclass, field
@@ -306,6 +305,11 @@ class DataManager:
             self._quick_start_load()
         else:
             self._full_load()
+
+        if hasattr(self.config, 'specific_view_mode') and self.config.specific_view_mode:
+            self.valid_indices = self.region_df[
+                self.region_df[self.config.specific_view_mode] == 1
+            ].index.tolist()
             
         logging.info("DataManager initialized.")
 
@@ -586,15 +590,7 @@ class DataManager:
             raise
 
     def load_image_data(self, index: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Load all image data for the current index using ImageProcessor.
-        
-        Args:
-            index: DataFrame index (not file_index)
-            
-        Returns:
-            Tuple of (subtracted, science, reference) image data
-        """
+        """Load all image data for the current index using ImageProcessor."""
         try:
             index = int(index)
             
@@ -606,10 +602,22 @@ class DataManager:
             tile_id = current_row['tile_id']
             unique_number = current_row['unique_number']
             
+            # Create a string-based cache key
+            cache_key = f"{tile_id}_{unique_number}"
+            
             logging.debug(f"Loading images for index {index}: tile_id={tile_id}, unique_number={unique_number}")
             
+            # Check cache first
+            if cache_key in self.image_cache:
+                return self.image_cache[cache_key]
+                
             # Use ImageProcessor to load and process images
-            return self.image_processor.load_and_process_images(tile_id, unique_number)
+            images = self.image_processor.load_and_process_images(tile_id, unique_number)
+            
+            # Cache the results with string key
+            self.image_cache[cache_key] = images
+            
+            return images
                 
         except Exception as e:
             logging.error(f"Error in load_image_data: {e}")
@@ -618,51 +626,47 @@ class DataManager:
     def start_preloading(self, current_index: int):
         """Start preloading images in a background thread."""
         try:
-            # Cancel any existing preload thread
-            if hasattr(self, 'preload_thread') and self.preload_thread.is_alive():
-                with self.preload_lock:
-                    self.preload_thread = None
+            next_indices = []
+            start_idx = current_index + 1
+            end_idx = min(start_idx + self.preload_batch_size, len(self.region_df))
             
-            # Start new preload thread
-            self.preload_thread = threading.Thread(
-                target=self.preload_images,
-                args=(current_index,),
-                daemon=True
-            )
-            self.preload_thread.start()
+            for idx in range(start_idx, end_idx):
+                current_row = self.region_df.iloc[idx]
+                cache_key = f"{current_row['tile_id']}_{current_row['unique_number']}"
+                if cache_key not in self.image_processor.image_cache:
+                    next_indices.append(idx)
             
+            if next_indices:
+                self.preload_thread = threading.Thread(
+                    target=self.preload_images,
+                    args=(next_indices,),
+                    daemon=True
+                )
+                self.preload_thread.start()
+                
         except Exception as e:
             logging.error(f"Error starting preload thread: {e}")
 
-    def preload_images(self, current_index: int):
-        """Preload next batch of images."""
+    def preload_images(self, indices):
+        """Preload images for given indices."""
         try:
-            with self.preload_lock:
-                # Calculate range of indices to preload
-                start_idx = current_index + 1
-                end_idx = min(
-                    start_idx + self.preload_batch_size,
-                    len(self.region_df)
-                )
+            if isinstance(indices, int):
+                indices = [indices]
                 
-                # Preload in background
-                for idx in range(start_idx, end_idx):
-                    if idx not in self.image_cache:
-                        try:
-                            current_row = self.region_df.iloc[idx]
-                            tile_id = current_row['tile_id']
-                            unique_number = current_row['unique_number']
-                            cache_key = f"{tile_id}_{unique_number}"
-                            
-                            if cache_key not in self.image_processor.image_cache:
-                                self.image_processor.load_and_process_images(
-                                    tile_id,
-                                    unique_number
-                                )
-                        except Exception as e:
-                            logging.error(f"Error preloading image at index {idx}: {e}")
-                            continue
-                            
+            for idx in indices:
+                try:
+                    current_row = self.region_df.iloc[idx]
+                    tile_id = current_row['tile_id']
+                    unique_number = current_row['unique_number']
+                    
+                    cache_key = f"{tile_id}_{unique_number}"
+                    if cache_key not in self.image_processor.image_cache:
+                        self.load_image_data(idx)
+                        
+                except Exception as e:
+                    logging.error(f"Error preloading image at index {idx}: {e}")
+                    continue
+                    
         except Exception as e:
             logging.error(f"Error in preload_images: {e}")
 
@@ -841,16 +845,24 @@ class ImageProcessor:
         self.cache_lock = threading.Lock()
         self.zscale = ZScaleInterval()
 
+    def _update_cache(self, key: str, value: Tuple[np.ndarray, np.ndarray, np.ndarray]):
+        """Thread-safe cache update."""
+        try:
+            with self.cache_lock:
+                if len(self.image_cache) >= self.cache_size:
+                    oldest_key = next(iter(self.image_cache))
+                    del self.image_cache[oldest_key]
+                self.image_cache[key] = value
+        except Exception as e:
+            logging.error(f"Error updating cache: {e}")
+
     def load_and_process_images(self, tile_id: str, unique_number: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Load and process all image types for a given identifier.
-        Single source of truth for image loading.
-        """
+        """Load and process all image types for a given identifier."""
         cache_key = f"{tile_id}_{unique_number}"
         
-        # Check cache first
-        if cache_key in self.image_cache:
-            return self.image_cache[cache_key]
+        with self.cache_lock:
+            if cache_key in self.image_cache:
+                return self.image_cache[cache_key]
             
         try:
             # Get image paths
@@ -861,7 +873,7 @@ class ImageProcessor:
             new_data = self._load_single_image(paths['new']) if paths['new'] else None
             ref_data = self._load_single_image(paths['ref']) if paths['ref'] else None
             
-            # Cache results
+            # Cache results using string key
             self._update_cache(cache_key, (sub_data, new_data, ref_data))
             
             return sub_data, new_data, ref_data
@@ -924,27 +936,12 @@ class ImageProcessor:
             logging.error(f"Error in _load_single_image for {filepath}: {e}")
             return None
             
-    def _update_cache(self, key: str, value: Tuple[np.ndarray, np.ndarray, np.ndarray]):
-        """Thread-safe cache update."""
-        with self.cache_lock:
-            if len(self.image_cache) >= self.cache_size:
-                oldest_key = next(iter(self.image_cache))
-                del self.image_cache[oldest_key]
-            self.image_cache[key] = value
-        
     def prepare_normalization(self, image: np.ndarray, vmin: Optional[float], vmax: Optional[float]) -> Any:
-        """
-        Create image normalization based on configured scale type.
-        
-        Args:
-            image: Image data
-            vmin: Minimum value setting ('min', 'median', etc.)
-            vmax: Maximum value setting ('max', 'median', etc.)
-            
-        Returns:
-            Matplotlib normalization object
-        """
+        """Create image normalization based on configured scale type."""
         try:
+            # Create a cache key from the parameters instead of using the array
+            cache_key = f"{vmin}_{vmax}_{self.config.scale}"
+            
             # Only convert to float if needed
             if image.dtype != np.float32 and image.dtype != np.float64:
                 image = image.astype(np.float32)
@@ -953,7 +950,6 @@ class ImageProcessor:
             v_min = self.validate_value(vmin, image) if isinstance(vmin, str) else vmin
             v_max = self.validate_value(vmax, image) if isinstance(vmax, str) else vmax
             
-            # Get actual min/max values based on settings
             if self.config.scale == 'zscale':
                 interval = self.zscale
                 v_min, v_max = interval.get_limits(image)
@@ -1042,8 +1038,15 @@ class TransientTool:
         initial_index = self.data_manager.get_starting_index()
         self.data_manager.start_preloading(initial_index)
         
+        # Set window title based on mode
+        if self.config.specific_view_mode:
+            self.master.title(f"Transient Tool - {self.config.specific_view_mode} View Mode")
+        elif self.config.view_mode:
+            self.master.title("Transient Tool - View Mode")
+        else:
+            self.master.title("Transient Detection Tool")
+        
         # Set up the main window
-        self.master.title("Transient Detection Tool")
         self.setup_ui()
 
         # Bind keyboard shortcuts after UI setup
@@ -1244,12 +1247,14 @@ class TransientTool:
         )
         self.prev_button.pack(side='left', padx=5)
         
-        self.goto_unclassified_button = Button(
-            nav_buttons_frame,
-            text=f"Go to Unclassified ({self.config.shortcuts.get('goto_unclassified_key', '')})",
-            command=self.goto_unclassified
-        )
-        self.goto_unclassified_button.pack(side='left', padx=5)
+        # Only show goto_unclassified button if not in specific view mode
+        if not self.config.specific_view_mode:
+            self.goto_unclassified_button = Button(
+                nav_buttons_frame,
+                text=f"Go to Unclassified ({self.config.shortcuts.get('goto_unclassified_key', '')})",
+                command=self.goto_unclassified
+            )
+            self.goto_unclassified_button.pack(side='left', padx=5)
         
         self.next_button = Button(
             nav_buttons_frame,
@@ -1292,7 +1297,9 @@ class TransientTool:
         # Jump to Image controls
         jump_frame = Frame(goto_inner_frame)
         jump_frame.pack(side='left', padx=20)
-        Label(jump_frame, text=f"Go to Image (1-{self.num_images}):").pack(side='left', padx=2)
+        max_index = len(self.data_manager.region_df) if not self.config.specific_view_mode else \
+                    len(self.data_manager.region_df[self.data_manager.region_df[self.config.specific_view_mode] == 1])
+        Label(jump_frame, text=f"Go to Image (1-{max_index}):").pack(side='left', padx=2)
         self.jump_entry = Entry(jump_frame, width=10)
         self.jump_entry.pack(side='left', padx=2)
         Button(jump_frame, text="Go", command=self.jump_to_image).pack(side='left', padx=2)
@@ -1624,37 +1631,31 @@ class TransientTool:
     def display_images(self):
         """
         Display current set of images with proper scaling and normalization.
-        
-        Loads and displays the current image set (subtracted, science, reference)
-        with appropriate scaling and normalization settings. Updates all UI elements
-        including zoom, labels, and progress indicators.
-        
-        Raises:
-            ValueError: If image data is invalid
-            IndexError: If current index is out of bounds
         """
         try:
-            for ax in self.axes:
-                ax.clear()
-
-            if self.index >= len(self.data_manager.region_df):
-                logging.error(f"Invalid index: {self.index}")
-                return
+            if not hasattr(self, '_current_index') or self._current_index != self.index:
+                self._current_index = self.index
                 
-            current_row = self.data_manager.region_df.iloc[self.index]
-            tile_id = current_row['tile_id']
-            unique_number = current_row['unique_number']
-            
-            if pd.isna(tile_id) or pd.isna(unique_number):
-                logging.error(f"Invalid tile_id or unique_number at index {self.index}")
-                return
+                # Clear only when necessary
+                for ax in self.axes:
+                    ax.clear()
 
-            # Load image data
-            sub_data, new_data, ref_data = self.data_manager.load_image_data(self.index)
-            
+                # Load image data only if needed
+                current_row = self.data_manager.region_df.iloc[self.index]
+                cache_key = f"{current_row['tile_id']}_{current_row['unique_number']}"
+                
+                if (not hasattr(self, '_current_cache_key') or 
+                    self._current_cache_key != cache_key):
+                    
+                    self._current_cache_key = cache_key
+                    sub_data, new_data, ref_data = self.data_manager.load_image_data(self.index)
+                    self._current_image_data = (sub_data, new_data, ref_data)
+                else:
+                    sub_data, new_data, ref_data = self._current_image_data
+
             # Set up the figure title
-            self.fig.suptitle(f"Tile ID: {tile_id} - Unique Number: {unique_number}", 
-                        fontsize=14, fontweight='bold')
+            title = f"Tile ID: {current_row['tile_id']} - Unique Number: {current_row['unique_number']}"
+            self.fig.suptitle(title, fontsize=14, fontweight='bold')
 
             # Update scale labels
             self.update_scale_labels(sub_data, new_data, ref_data)
@@ -1722,7 +1723,7 @@ class TransientTool:
             self.update_progress_display()
             
             # Load memo for current image
-            self.load_memo(unique_number)
+            self.load_memo(current_row['unique_number'])
             
             # Start preloading next batch
             self.data_manager.start_preloading(self.index)
@@ -2086,10 +2087,7 @@ class TransientTool:
     def goto_unique_number(self):
         """Go to specific unique number within current tile."""
         try:
-            # Get current tile_id
             current_tile = self.data_manager.region_df.iloc[self.index]['tile_id']
-            
-            # Get unique number from entry box
             unique_num_str = self.unique_entry.get().strip()
             if not unique_num_str:
                 return
@@ -2101,22 +2099,25 @@ class TransientTool:
                 return
                 
             # Find the unique number within the current tile
-            matching_images = self.data_manager.region_df[
-                (self.data_manager.region_df['tile_id'] == current_tile) & 
-                (self.data_manager.region_df['unique_number'] == unique_num)
-            ]
+            query = (self.data_manager.region_df['tile_id'] == current_tile) & \
+                    (self.data_manager.region_df['unique_number'] == unique_num)
+                    
+            if self.config.specific_view_mode:
+                # Check if the target image has the specific classification
+                target_image = self.data_manager.region_df[query]
+                if not target_image.empty and target_image[self.config.specific_view_mode].iloc[0] != 1:
+                    messagebox.showwarning("Warning", 
+                        f"Image does not have {self.config.specific_view_mode} classification")
+                    return
+                    
+            matching_images = self.data_manager.region_df[query]
             
             if not matching_images.empty:
-                # Get the actual index from the DataFrame
                 target_index = matching_images.index[0]
-                
-                # Update display
                 self.index = target_index
                 self.science_data = None
                 self.reference_data = None
                 self.display_images()
-                
-                logging.info(f"Jumped to image with unique number {unique_num} at index {target_index}")
             else:
                 messagebox.showinfo("Not Found", 
                                   f"Unique number {unique_num} not found in tile {current_tile}")
